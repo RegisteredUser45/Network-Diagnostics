@@ -1,0 +1,4 @@
+# Windows field laptop. tkinter is stdlib.
+pyserial>=3.5
+# Optional for CDP/LLDP capture (needs Npcap on Windows):
+# scapy>=2.5
