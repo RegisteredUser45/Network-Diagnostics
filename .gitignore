@@ -8,3 +8,5 @@ secrets.bin
 *.log
 .DS_Store
 Thumbs.db
+netDiag-Field-and-Insurance-Brief.pdf
+*Insurance-Brief*.pdf
