@@ -5,19 +5,17 @@ transceivers, MAC table grab/compare, live CLI).
 
 ## Run on a field laptop
 
-Needs Python 3 (tkinter is stdlib). pyserial is required for serial. Scapy +
-Npcap are optional and only used for CDP/LLDP listen.
+Needs Python 3.10+ installed once (https://www.python.org/downloads/ — check
+"Add python.exe to PATH"). Then:
 
-```
-python -m venv .venv
-.venv\Scripts\pip install -r requirements.txt
-run_netdiag.bat
-```
+1. Copy or `git pull` this folder.
+2. Double-click `run_netdiag.bat`.
 
-Or, with Python already on PATH: `python netdiag.py`
+First run creates `.venv` in this folder and installs `requirements.txt`
+(pyserial, scapy). Later runs skip that and start the GUI.
 
-`run_netdiag.bat` uses this folder's `.venv` when present, otherwise `pythonw` /
-`python` on PATH.
+Do not run `python netdiag.py` from a random interpreter on first launch — use
+the bat so the venv exists. `.venv` is gitignored; each laptop builds its own.
 
 For CDP/LLDP: install Npcap from https://npcap.com with WinPcap API-compatible
 mode, and do not restrict the driver to Administrators. If capture still wants
