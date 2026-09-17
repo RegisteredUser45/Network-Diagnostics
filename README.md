@@ -13,8 +13,10 @@ Needs Python 3.10+ installed once (https://www.python.org/downloads/ — check
 
 First run creates `.venv` in this folder, installs `requirements.txt`
 (pyserial, scapy), and places a **netDiag** shortcut on the Desktop (8-pin
-network icon, launches `netdiag.py` through the local venv). Later runs skip
-setup and start the GUI.
+network icon, launches `netdiag.py` through the local venv). `settings.json`
+has `"venv_created": 0` in the repo; after a successful setup the launcher
+sets it to `1` so later runs skip venv creation. Set it back to `0` to force
+setup again.
 
 Do not run `python netdiag.py` from a random interpreter on first launch — use
 the bat so the venv exists. `.venv` is gitignored; each laptop builds its own.

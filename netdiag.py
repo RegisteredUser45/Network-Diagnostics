@@ -37,6 +37,8 @@ ACTIVE_CUSTOMER = "Default"
 # "skip" = do not drive login; open a raw terminal
 LOGIN_MODES = ("auto", "manual", "skip")
 LOGIN_MODE = "auto"
+# 0 = first run should create .venv; 1 = skip venv setup
+VENV_CREATED = 0
 LAST_SUCCESS_USERNAME = ""
 LAST_SUCCESS_PASSWORD = ""
 LAST_SUCCESS_CUSTOMER = ""
@@ -470,6 +472,26 @@ def _sync_active_aliases():
     PROFILES = customer["host_secrets"]
 
 
+def _parse_venv_created(value) -> int:
+    """1 = skip venv setup, 0 = create venv. Accepts 0/1 and common JSON bools."""
+    if value in (1, True, "1", "true", "True", "yes"):
+        return 1
+    if value in (0, False, "0", "false", "False", "no", None, ""):
+        return 0
+    try:
+        return 1 if int(value) == 1 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def set_venv_created(value) -> bool:
+    """Persist venv_created (0/1) in settings.json without dropping other fields."""
+    global VENV_CREATED
+    with _STATE_LOCK:
+        VENV_CREATED = _parse_venv_created(value)
+        return _write_settings()
+
+
 def load_settings():
     """Load public customer names from settings.json and secrets from DPAPI.
 
@@ -477,7 +499,7 @@ def load_settings():
     password, or host_secrets, those fields are ignored (not imported, not
     rewritten on load).
     """
-    global USERNAME, PASSWORD, CUSTOMERS, ACTIVE_CUSTOMER, LOGIN_MODE
+    global USERNAME, PASSWORD, CUSTOMERS, ACTIVE_CUSTOMER, LOGIN_MODE, VENV_CREATED
 
     path = settings_file()
     try:
@@ -497,6 +519,8 @@ def load_settings():
 
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+
+        VENV_CREATED = _parse_venv_created(data.get("venv_created", 0))
 
         mode = str(data.get("login_mode", "auto")).strip().lower()
         LOGIN_MODE = mode if mode in LOGIN_MODES else "auto"
@@ -537,6 +561,12 @@ def load_settings():
                             break
                 if blob:
                     _merge_secret_blob(customer, blob)
+            for name, blob in secret_map.items():
+                if _find_customer_index(name) is not None:
+                    continue
+                extra = _make_customer(name, "", "")
+                _merge_secret_blob(extra, blob)
+                CUSTOMERS.append(extra)
 
         _sync_active_aliases()
         # Leftover plaintext in settings.json is ignored. Do not rewrite on
@@ -716,6 +746,7 @@ def _write_settings() -> bool:
             return False
         path = settings_file()
         data = {
+            "venv_created": 1 if VENV_CREATED else 0,
             "active_customer": ACTIVE_CUSTOMER,
             "login_mode": get_login_mode(),
             "customers": _public_customers(),
@@ -3797,5 +3828,8 @@ def launch():
 if __name__ == "__main__":
     if "--install-shortcut" in sys.argv:
         ensure_desktop_shortcut()
+        raise SystemExit(0)
+    if "--mark-venv-created" in sys.argv:
+        set_venv_created(1)
         raise SystemExit(0)
     main()

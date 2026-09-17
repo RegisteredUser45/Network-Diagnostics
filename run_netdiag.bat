@@ -91,13 +91,35 @@ echo.
 pause
 exit /b 1
 
+:read_venv_created
+set "VENV_CREATED=0"
+if not exist "%~dp0settings.json" exit /b 0
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { $j = Get-Content -Raw -LiteralPath '%~dp0settings.json' | ConvertFrom-Json; if ([int](('0' + $j.venv_created))) { exit 1 } else { exit 0 } } catch { exit 0 }"
+if errorlevel 1 set "VENV_CREATED=1"
+exit /b 0
+
+:mark_venv_created
+"%VENV_PY%" "%~dp0netdiag.py" --mark-venv-created
+exit /b 0
+
 :main
+call :read_venv_created
+if "%VENV_CREATED%"=="1" if exist "%VENV_PY%" goto :after_setup
+
 call :ensure_venv
 if errorlevel 1 exit /b 1
 call :ensure_deps
 if errorlevel 1 exit /b 1
 call :ensure_tk
 if errorlevel 1 exit /b 1
+call :mark_venv_created
+
+:after_setup
+if not exist "%VENV_PY%" (
+  echo .venv is missing. Set venv_created to 0 in settings.json and run again.
+  pause
+  exit /b 1
+)
 
 echo Creating desktop shortcut...
 "%VENV_PY%" "%~dp0netdiag.py" --install-shortcut

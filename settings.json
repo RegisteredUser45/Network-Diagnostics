@@ -1,0 +1,11 @@
+{
+  "venv_created": 0,
+  "active_customer": "Default",
+  "login_mode": "auto",
+  "customers": [
+    {
+      "name": "Default",
+      "seen_hostnames": []
+    }
+  ]
+}

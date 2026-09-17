@@ -3,7 +3,6 @@ __pycache__/
 venv/
 .venv/
 env/
-settings.json
 secrets.bin
 *.log
 .DS_Store
