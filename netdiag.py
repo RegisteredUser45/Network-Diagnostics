@@ -11,6 +11,8 @@ Scapy is optional for live CDP/LLDP capture (Npcap on Windows).
 
 import json
 import os
+import sys
+import subprocess
 import threading
 import queue
 import time
@@ -71,6 +73,95 @@ def secrets_file():
         return Path(override)
     root = os.environ.get("LOCALAPPDATA") or str(Path.home())
     return Path(root) / "netDiag" / "secrets.bin"
+
+
+def _project_dir() -> Path:
+    return Path(__file__).resolve().parent
+
+
+def _local_venv_pythonw() -> Path:
+    return _project_dir() / ".venv" / "Scripts" / "pythonw.exe"
+
+
+def _local_venv_python() -> Path:
+    return _project_dir() / ".venv" / "Scripts" / "python.exe"
+
+
+def _running_from_local_venv() -> bool:
+    exe = Path(sys.executable).resolve()
+    for candidate in (_local_venv_pythonw(), _local_venv_python()):
+        try:
+            if candidate.exists() and exe == candidate.resolve():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _reexec_local_venv():
+    """If a project venv exists, run this file with it (desktop .py shortcut)."""
+    if os.name != "nt" or _running_from_local_venv():
+        return
+    target = _local_venv_pythonw()
+    if not target.exists():
+        target = _local_venv_python()
+    if not target.exists():
+        return
+    os.execv(str(target), [str(target), str(Path(__file__).resolve()), *sys.argv[1:]])
+
+
+def ensure_desktop_shortcut():
+    """Place netDiag.lnk on this user's Desktop, pointing at netdiag.py."""
+    if os.name != "nt":
+        return
+    def ps_lit(value):
+        return "'" + str(value).replace("'", "''") + "'"
+
+    here = ps_lit(_project_dir())
+    script = ps_lit(_project_dir() / "netdiag.py")
+    ico = ps_lit(_project_dir() / "netdiag.ico")
+    pythonw = ps_lit(_local_venv_pythonw())
+    ps = (
+        "$desktop = [Environment]::GetFolderPath('Desktop'); "
+        "if (-not $desktop) { exit 0 }; "
+        "$lnk = Join-Path $desktop 'netDiag.lnk'; "
+        "$ws = New-Object -ComObject WScript.Shell; "
+        "$s = $ws.CreateShortcut($lnk); "
+        f"$script = {script}; "
+        f"$here = {here}; "
+        f"$ico = {ico}; "
+        f"$pythonw = {pythonw}; "
+        "if (Test-Path -LiteralPath $pythonw) { "
+        "  $s.TargetPath = $pythonw; "
+        "  $s.Arguments = ('\"{0}\"' -f $script); "
+        "} else { "
+        "  $s.TargetPath = $script; "
+        "  $s.Arguments = ''; "
+        "} "
+        "$s.WorkingDirectory = $here; "
+        "$s.WindowStyle = 1; "
+        "$s.Description = 'netDiag'; "
+        "if (Test-Path -LiteralPath $ico) { $s.IconLocation = $ico }; "
+        "$s.Save()"
+    )
+    try:
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-STA",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                ps,
+            ],
+            check=False,
+            capture_output=True,
+            creationflags=flags,
+        )
+    except Exception:
+        pass
 
 
 def is_local_com_port(port) -> bool:
@@ -2124,6 +2215,8 @@ def start_serial_session(
 
 def main():
     """Primary entry point. Starts the netDiag GUI application."""
+    _reexec_local_venv()
+    ensure_desktop_shortcut()
     root = tk.Tk()
     app = CDP_LLDP_GUI(root)
     root.protocol("WM_DELETE_WINDOW", app.on_closing)
@@ -3702,4 +3795,7 @@ def launch():
     main()
 
 if __name__ == "__main__":
+    if "--install-shortcut" in sys.argv:
+        ensure_desktop_shortcut()
+        raise SystemExit(0)
     main()

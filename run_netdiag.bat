@@ -99,6 +99,12 @@ if errorlevel 1 exit /b 1
 call :ensure_tk
 if errorlevel 1 exit /b 1
 
+echo Creating desktop shortcut...
+"%VENV_PY%" "%~dp0netdiag.py" --install-shortcut
+if errorlevel 1 (
+  echo Shortcut could not be created. Starting anyway.
+)
+
 echo Starting netDiag...
 if exist "%VENV_PYW%" (
   start "" "%VENV_PYW%" "%~dp0netdiag.py"
