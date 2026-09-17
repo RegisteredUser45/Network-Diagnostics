@@ -1498,7 +1498,7 @@ def _parse_mac_table(output: str) -> dict:
     """Best-effort parser for typical 'show mac address-table' output.
 
     Returns: {normalized_mac_12hex_lowercase: port_string}
-    Works with common Cisco 'show mac address-table' formats.
+    Works with common 'show mac address-table' formats.
     """
     table = {}
     for line in output.splitlines():
@@ -2343,7 +2343,7 @@ class SerialWindow:
             self.append_output(f"[MAC tree error] {e}")
 
     def send_command(self):
-        """Send whatever is in the bar, including a bare Enter (Cisco Press RETURN)."""
+        """Send whatever is in the bar, including a bare Enter (Press RETURN)."""
         cmd = self.cmd_entry.get()
         self.session.send_line(cmd)
         self.cmd_entry.delete(0, tk.END)
