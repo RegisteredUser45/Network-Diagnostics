@@ -53,15 +53,22 @@ _PROMPT_HOST_BLOCKLIST = {
 _SECRETS_USE_DPAPI = os.name == "nt"
 _SECRETS_ENTROPY = b"netDiag-local-secrets-v1"
 _DPAPI_UI_FORBIDDEN = 0x01
+_STATE_LOCK = threading.RLock()
 
 
 def settings_file():
     """Non-secret UI state (customer names, login mode, seen hostnames)."""
+    override = os.environ.get("NETDIAG_SETTINGS")
+    if override:
+        return Path(override)
     return Path(__file__).parent / "settings.json"
 
 
 def secrets_file():
     """Encrypted secret store. Stays on this Windows user, not in the project folder."""
+    override = os.environ.get("NETDIAG_SECRETS")
+    if override:
+        return Path(override)
     root = os.environ.get("LOCALAPPDATA") or str(Path.home())
     return Path(root) / "netDiag" / "secrets.bin"
 
@@ -185,13 +192,20 @@ def _secret_payload():
 
 def _write_secret_store() -> bool:
     path = secrets_file()
+    tmp = path.with_name(path.name + ".tmp")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         blob = _protect_bytes(json.dumps(_secret_payload()).encode("utf-8"))
-        path.write_bytes(blob)
+        tmp.write_bytes(blob)
+        os.replace(tmp, path)
         _restrict_to_current_user(path)
         return True
     except OSError:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
         return False
 
 
@@ -369,7 +383,8 @@ def load_settings():
     """Load public customer names from settings.json and secrets from DPAPI.
 
     settings.json is never a secret source. If an old file still has username,
-    password, or host_secrets, those fields are ignored and stripped on write.
+    password, or host_secrets, those fields are ignored (not imported, not
+    rewritten on load).
     """
     global USERNAME, PASSWORD, CUSTOMERS, ACTIVE_CUSTOMER, LOGIN_MODE
 
@@ -391,8 +406,6 @@ def load_settings():
 
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
-
-        leftover_plaintext = _json_has_plaintext_secrets(data)
 
         mode = str(data.get("login_mode", "auto")).strip().lower()
         LOGIN_MODE = mode if mode in LOGIN_MODES else "auto"
@@ -435,8 +448,8 @@ def load_settings():
                     _merge_secret_blob(customer, blob)
 
         _sync_active_aliases()
-        if leftover_plaintext:
-            _write_settings()
+        # Leftover plaintext in settings.json is ignored. Do not rewrite on
+        # load — that would persist empty secrets and drop a good DPAPI store.
 
     except (json.JSONDecodeError, OSError, TypeError, ValueError):
         _sync_active_aliases()
@@ -451,8 +464,9 @@ def set_login_mode(mode) -> bool:
     mode = str(mode or "").strip().lower()
     if mode not in LOGIN_MODES:
         return False
-    LOGIN_MODE = mode
-    return _write_settings()
+    with _STATE_LOCK:
+        LOGIN_MODE = mode
+        return _write_settings()
 
 
 def get_customers():
@@ -481,9 +495,10 @@ def set_active_customer(name) -> bool:
     idx = _find_customer_index(name)
     if idx is None:
         return False
-    ACTIVE_CUSTOMER = CUSTOMERS[idx]["name"]
-    _sync_active_aliases()
-    return _write_settings()
+    with _STATE_LOCK:
+        ACTIVE_CUSTOMER = CUSTOMERS[idx]["name"]
+        _sync_active_aliases()
+        return _write_settings()
 
 
 def upsert_customer(name, username, password) -> bool:
@@ -497,52 +512,55 @@ def upsert_customer(name, username, password) -> bool:
     password = str(password or "").strip()
     if not name:
         return False
-    idx = _find_customer_index(name)
-    if idx is None:
-        CUSTOMERS.append(_make_customer(name, username, password))
-        ACTIVE_CUSTOMER = CUSTOMERS[-1]["name"]
-    else:
-        CUSTOMERS[idx]["name"] = name
-        CUSTOMERS[idx]["username"] = username
-        CUSTOMERS[idx]["password"] = password
-        ACTIVE_CUSTOMER = name
-    _sync_active_aliases()
-    return _write_settings()
+    with _STATE_LOCK:
+        idx = _find_customer_index(name)
+        if idx is None:
+            CUSTOMERS.append(_make_customer(name, username, password))
+            ACTIVE_CUSTOMER = CUSTOMERS[-1]["name"]
+        else:
+            CUSTOMERS[idx]["name"] = name
+            CUSTOMERS[idx]["username"] = username
+            CUSTOMERS[idx]["password"] = password
+            ACTIVE_CUSTOMER = name
+        _sync_active_aliases()
+        return _write_settings()
 
 
 def rename_customer(old_name, new_name) -> bool:
     """Rename a customer in place. Fails if the new name is already used."""
     global ACTIVE_CUSTOMER
-    idx = _find_customer_index(old_name)
     new_name = str(new_name or "").strip()
-    if idx is None or not new_name:
-        return False
-    other = _find_customer_index(new_name)
-    if other is not None and other != idx:
-        return False
-    CUSTOMERS[idx]["name"] = new_name
-    if idx == _find_customer_index(ACTIVE_CUSTOMER) or normalize_customer_name(
-        ACTIVE_CUSTOMER
-    ) == normalize_customer_name(old_name):
-        ACTIVE_CUSTOMER = new_name
-    _sync_active_aliases()
-    return _write_settings()
+    with _STATE_LOCK:
+        idx = _find_customer_index(old_name)
+        if idx is None or not new_name:
+            return False
+        other = _find_customer_index(new_name)
+        if other is not None and other != idx:
+            return False
+        CUSTOMERS[idx]["name"] = new_name
+        if idx == _find_customer_index(ACTIVE_CUSTOMER) or normalize_customer_name(
+            ACTIVE_CUSTOMER
+        ) == normalize_customer_name(old_name):
+            ACTIVE_CUSTOMER = new_name
+        _sync_active_aliases()
+        return _write_settings()
 
 
 def delete_customer(name) -> bool:
     """Remove a customer profile. Keeps at least one customer."""
     global ACTIVE_CUSTOMER
-    if len(CUSTOMERS) <= 1:
-        return False
-    idx = _find_customer_index(name)
-    if idx is None:
-        return False
-    removing_active = idx == _find_customer_index(ACTIVE_CUSTOMER)
-    CUSTOMERS.pop(idx)
-    if removing_active:
-        ACTIVE_CUSTOMER = CUSTOMERS[0]["name"]
-    _sync_active_aliases()
-    return _write_settings()
+    with _STATE_LOCK:
+        if len(CUSTOMERS) <= 1:
+            return False
+        idx = _find_customer_index(name)
+        if idx is None:
+            return False
+        removing_active = idx == _find_customer_index(ACTIVE_CUSTOMER)
+        CUSTOMERS.pop(idx)
+        if removing_active:
+            ACTIVE_CUSTOMER = CUSTOMERS[0]["name"]
+        _sync_active_aliases()
+        return _write_settings()
 
 
 def get_credentials():
@@ -601,23 +619,31 @@ def _write_settings() -> bool:
     If the secret store cannot be written, public settings are left unchanged
     so we never rewrite settings.json unless secrets are already in the store.
     """
-    _sync_active_aliases()
-    if not _write_secret_store():
-        return False
-    path = settings_file()
-    data = {
-        "active_customer": ACTIVE_CUSTOMER,
-        "login_mode": get_login_mode(),
-        "customers": _public_customers(),
-    }
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
-        _restrict_to_current_user(path)
-        return True
-    except OSError:
-        return False
+    with _STATE_LOCK:
+        _sync_active_aliases()
+        if not _write_secret_store():
+            return False
+        path = settings_file()
+        data = {
+            "active_customer": ACTIVE_CUSTOMER,
+            "login_mode": get_login_mode(),
+            "customers": _public_customers(),
+        }
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.write("\n")
+            os.replace(tmp, path)
+            _restrict_to_current_user(path)
+            return True
+        except OSError:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:
+                pass
+            return False
 
 
 load_settings()
@@ -633,64 +659,67 @@ def save_settings(username: str, password: str) -> bool:
 
 def save_profiles(profiles) -> bool:
     """Replace host-exception secrets on the active customer."""
-    customer = get_active_customer()
-    if not customer:
-        return False
-    cleaned = []
-    seen = set()
-    for item in profiles or []:
-        secret = _sanitize_host_secret(item)
-        if not secret:
-            continue
-        key = normalize_hostname(secret["hostname"])
-        if key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(secret)
-    customer["host_secrets"] = cleaned
-    _sync_active_aliases()
-    return _write_settings()
+    with _STATE_LOCK:
+        customer = get_active_customer()
+        if not customer:
+            return False
+        cleaned = []
+        seen = set()
+        for item in profiles or []:
+            secret = _sanitize_host_secret(item)
+            if not secret:
+                continue
+            key = normalize_hostname(secret["hostname"])
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(secret)
+        customer["host_secrets"] = cleaned
+        _sync_active_aliases()
+        return _write_settings()
 
 
 def upsert_hostname_profile(hostname, username, password) -> bool:
     """Create or update a host-exception secret on the active customer."""
-    customer = get_active_customer()
-    if not customer:
-        return False
     hostname = str(hostname or "").strip()
     username = str(username or "").strip()
     password = str(password or "").strip()
     if not hostname or not username or not password:
         return False
-    key = normalize_hostname(hostname)
-    for secret in customer["host_secrets"]:
-        if normalize_hostname(secret["hostname"]) == key:
-            secret["hostname"] = hostname
-            secret["username"] = username
-            secret["password"] = password
-            break
-    else:
-        customer["host_secrets"].append(
-            {"hostname": hostname, "username": username, "password": password}
-        )
-    _sync_active_aliases()
-    return _write_settings()
+    with _STATE_LOCK:
+        customer = get_active_customer()
+        if not customer:
+            return False
+        key = normalize_hostname(hostname)
+        for secret in customer["host_secrets"]:
+            if normalize_hostname(secret["hostname"]) == key:
+                secret["hostname"] = hostname
+                secret["username"] = username
+                secret["password"] = password
+                break
+        else:
+            customer["host_secrets"].append(
+                {"hostname": hostname, "username": username, "password": password}
+            )
+        _sync_active_aliases()
+        return _write_settings()
 
 
 def record_seen_hostname(hostname) -> bool:
     """Remember a hostname on the active customer without storing a new secret."""
-    customer = get_active_customer()
     hostname = str(hostname or "").strip()
-    if not customer or not hostname:
-        return False
-    key = normalize_hostname(hostname)
-    for existing in customer["seen_hostnames"]:
-        if normalize_hostname(existing) == key:
-            return True
-    customer["seen_hostnames"].append(hostname)
-    if len(customer["seen_hostnames"]) > _MAX_SEEN_HOSTNAMES:
-        customer["seen_hostnames"] = customer["seen_hostnames"][-_MAX_SEEN_HOSTNAMES:]
-    return _write_settings()
+    with _STATE_LOCK:
+        customer = get_active_customer()
+        if not customer or not hostname:
+            return False
+        key = normalize_hostname(hostname)
+        for existing in customer["seen_hostnames"]:
+            if normalize_hostname(existing) == key:
+                return True
+        customer["seen_hostnames"].append(hostname)
+        if len(customer["seen_hostnames"]) > _MAX_SEEN_HOSTNAMES:
+            customer["seen_hostnames"] = customer["seen_hostnames"][-_MAX_SEEN_HOSTNAMES:]
+        return _write_settings()
 
 
 def remember_successful_login(username, password, hostname=None):
@@ -705,26 +734,29 @@ def remember_successful_login(username, password, hostname=None):
     password = str(password or "").strip()
     if not username or not password:
         return
-    LAST_SUCCESS_USERNAME = username
-    LAST_SUCCESS_PASSWORD = password
-    LAST_SUCCESS_CUSTOMER = get_active_customer_name()
-    if hostname:
-        record_seen_hostname(hostname)
-        existing = credentials_for_hostname(hostname)
-        if existing == (username, password):
-            return
-        if (username, password) == get_credentials():
-            return
-        upsert_hostname_profile(hostname, username, password)
+    with _STATE_LOCK:
+        LAST_SUCCESS_USERNAME = username
+        LAST_SUCCESS_PASSWORD = password
+        LAST_SUCCESS_CUSTOMER = get_active_customer_name()
+        if hostname:
+            record_seen_hostname(hostname)
+            existing = credentials_for_hostname(hostname)
+            if existing == (username, password):
+                return
+            if (username, password) == get_credentials():
+                return
+            upsert_hostname_profile(hostname, username, password)
 
 
 def list_login_attempts(hostname_hint=None, extra=None, mode=None):
     """Credential tries for the *active customer only*.
 
     auto: host hint (if any) → extra → last success (this customer) →
-          customer default → this customer's host exceptions.
+          customer default.
     manual: host hint exception (if any) → extra → customer default.
-    Other customers' secrets are never tried.
+    Other customers' secrets are never tried. Other devices on this customer
+    are not tried unless that hostname is the hint — walking every host
+    password can lock a local account.
     """
     attempts = []
     seen = set()
@@ -776,12 +808,6 @@ def list_login_attempts(hostname_hint=None, extra=None, mode=None):
         add("last successful login", LAST_SUCCESS_USERNAME, LAST_SUCCESS_PASSWORD)
 
     add(f"{cust_name} default", default_user, default_pass)
-    for secret in host_secrets:
-        add(
-            f"{cust_name} host {secret['hostname']}",
-            secret["username"],
-            secret["password"],
-        )
     return attempts
 
 
@@ -2708,7 +2734,7 @@ class CDP_LLDP_GUI:
                         "\n\nNpcap is in Admin-only mode, which is why capture wants elevation.\n"
                         "Run allow_npcap_nonadmin.bat once (UAC that one time), then start "
                         "netDiag normally. Capture capability is unchanged.\n"
-                        "Fallback: right-click run_netDiag.bat → Run as administrator."
+                        "Fallback: right-click run_netdiag.bat → Run as administrator."
                     )
                 else:
                     msg += (
@@ -2716,7 +2742,7 @@ class CDP_LLDP_GUI:
                         "\"WinPcap API-compatible Mode\" enabled and "
                         "\"Restrict Npcap driver's access to Administrators only\" unchecked.\n"
                         "If capture still fails, run allow_npcap_nonadmin.bat once, or "
-                        "right-click run_netDiag.bat → Run as administrator."
+                        "right-click run_netdiag.bat → Run as administrator."
                     )
             self.show_error_dialog("Capture Failed", msg)
 
@@ -3457,22 +3483,22 @@ class CDP_LLDP_GUI:
             chosen_customer = customer_var.get().strip()
             if chosen_customer:
                 set_active_customer(chosen_customer)
-            if not upsert_customer(chosen_customer or get_active_customer_name(),
-                                   user_var.get(), pass_var.get()):
-                messagebox.showerror(
-                    "Serial",
-                    "Could not save credentials (Windows secret store).",
-                    parent=dlg,
-                )
-                return
             mode = mode_var.get().strip() or "auto"
             set_login_mode(mode)
             hint = hint_var.get().strip()
             if mode == "skip" or not hint or hint.startswith("(unknown"):
                 hint = None
+            session_user = user_var.get().strip()
+            session_pass = pass_var.get()
             dlg.destroy()
             self._refresh_customer_label()
-            self._start_serial_login(chosen_port, hostname_hint=hint, login_mode=mode)
+            self._start_serial_login(
+                chosen_port,
+                hostname_hint=hint,
+                login_mode=mode,
+                username=session_user,
+                password=session_pass,
+            )
 
         btn_frame = ttk.Frame(dlg)
         btn_frame.pack(pady=12)
@@ -3481,11 +3507,27 @@ class CDP_LLDP_GUI:
 
         listbox.bind("<Double-1>", lambda e: do_connect())
 
-    def _start_serial_login(self, port, hostname_hint=None, login_mode=None):
-        """Thin GUI wrapper. Real login orchestration (worker, open, login, callbacks) is in start_serial_session."""
+    def _start_serial_login(
+        self,
+        port,
+        hostname_hint=None,
+        login_mode=None,
+        username=None,
+        password=None,
+    ):
+        """Thin GUI wrapper. Real login orchestration (worker, open, login, callbacks) is in start_serial_session.
+
+        Form username/password are tried for this session only. They are not
+        written unless the tech used Save to this customer.
+        """
         self.status_var.set(f"Connecting to {port}...")
 
-        user, pwd = get_credentials()
+        form_user = str(username or "").strip()
+        form_pass = password if password is not None else ""
+        if form_user and form_pass:
+            user, pwd = form_user, form_pass
+        else:
+            user, pwd = get_credentials()
 
         def on_success(session, port_name):
             # Put on the GUI queue so the existing process_queue path creates the window
