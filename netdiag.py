@@ -30,7 +30,11 @@ PASSWORD = ""
 PROFILES = []  # alias: host exceptions on the active customer
 CUSTOMERS = []
 ACTIVE_CUSTOMER = "Default"
-LOGIN_MODE = "auto"  # "auto" (try this customer's secrets) or "manual" (one host)
+# "auto" = try this customer's secrets
+# "manual" = one selected hostname's secret
+# "skip" = do not drive login; open a raw terminal
+LOGIN_MODES = ("auto", "manual", "skip")
+LOGIN_MODE = "auto"
 LAST_SUCCESS_USERNAME = ""
 LAST_SUCCESS_PASSWORD = ""
 LAST_SUCCESS_CUSTOMER = ""
@@ -391,7 +395,7 @@ def load_settings():
         leftover_plaintext = _json_has_plaintext_secrets(data)
 
         mode = str(data.get("login_mode", "auto")).strip().lower()
-        LOGIN_MODE = mode if mode in ("auto", "manual") else "auto"
+        LOGIN_MODE = mode if mode in LOGIN_MODES else "auto"
 
         loaded = []
         seen_names = set()
@@ -439,13 +443,13 @@ def load_settings():
 
 
 def get_login_mode():
-    return LOGIN_MODE if LOGIN_MODE in ("auto", "manual") else "auto"
+    return LOGIN_MODE if LOGIN_MODE in LOGIN_MODES else "auto"
 
 
 def set_login_mode(mode) -> bool:
     global LOGIN_MODE
     mode = str(mode or "").strip().lower()
-    if mode not in ("auto", "manual"):
+    if mode not in LOGIN_MODES:
         return False
     LOGIN_MODE = mode
     return _write_settings()
@@ -725,8 +729,10 @@ def list_login_attempts(hostname_hint=None, extra=None, mode=None):
     attempts = []
     seen = set()
     mode = (mode or get_login_mode()).strip().lower()
-    if mode not in ("auto", "manual"):
+    if mode not in LOGIN_MODES:
         mode = "auto"
+    if mode == "skip":
+        return attempts
     customer = get_active_customer()
     cust_name = customer["name"] if customer else "Default"
     default_user = customer["username"] if customer else USERNAME
@@ -934,6 +940,7 @@ class SerialSession:
         self.baudrate = baudrate
         self.ser = None
         self.connected = False
+        self.auto_login = True
         self.prompt_char = ">"
         self.read_queue = queue.Queue()
         self._sub_lock = threading.Lock()
@@ -1004,7 +1011,7 @@ class SerialSession:
                                 self._emit_line(line.rstrip('\r\n'))
 
                         detect_window = buffer[-512:] if len(buffer) > 512 else buffer
-                        if self._detect_new_device(detect_window):
+                        if self.auto_login and self._detect_new_device(detect_window):
                             buffer = ""
                             self._relogin_unlocked(
                                 reason="New device detected — logging in"
@@ -1259,6 +1266,8 @@ class SerialSession:
 
     def _relogin_unlocked(self, reason="New device detected — logging in"):
         """Attempt login with hostname profiles. Caller must hold login_lock."""
+        if not self.auto_login:
+            return self.connected
         if self._relogin_in_progress:
             return self.connected
 
@@ -1312,11 +1321,26 @@ class SerialSession:
             if not ok:
                 return False
 
-            if not self.reader_thread or not self.reader_thread.is_alive():
-                self.stop_event.clear()
-                self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
-                self.reader_thread.start()
+            self.start_reader()
             return True
+
+    def start_reader(self):
+        """Start the background UART reader if it is not already running."""
+        if not self.reader_thread or not self.reader_thread.is_alive():
+            self.stop_event.clear()
+            self.reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
+            self.reader_thread.start()
+
+    def attach_console(self):
+        """Live terminal on the open port. Does not type username/password."""
+        self.auto_login = False
+        self.connected = True
+        self.start_reader()
+        self._emit_line(
+            "[SERIAL] Terminal open — automatic login is off. "
+            "Type at the CLI (Enter at Username:/Password: yourself)."
+        )
+        return True
 
     def _drain_uart_display_only(self):
         """Flush leftover UART into display queues before arming command capture.
@@ -1347,21 +1371,23 @@ class SerialSession:
     def send_line(self, line):
         """Send a command line (adds carriage return). Echo comes back via the reader."""
         with self.login_lock:
-            if not self.connected:
+            if not self.ser or not self.ser.is_open:
+                self._emit_line("[SEND] Serial port is not open")
+                return
+            if self.auto_login and not self.connected:
                 self._emit_line(
                     "[SEND] Not connected — waiting for new device login prompt"
                 )
                 return
 
-            if self.ser and self.ser.is_open:
-                try:
-                    self._send_raw(line)
-                except Exception as e:
-                    self._mark_disconnected(
-                        "[SERIAL] Send failed — cable may have moved. "
-                        "Waiting for new device..."
-                    )
-                    self._emit_line(f"[SEND ERROR] {e}")
+            try:
+                self._send_raw(line)
+            except Exception as e:
+                self._mark_disconnected(
+                    "[SERIAL] Send failed — cable may have moved. "
+                    "Waiting for new device..."
+                )
+                self._emit_line(f"[SEND ERROR] {e}")
 
     def execute_command(self, cmd, wait_prompt=True, timeout=15):
         """Send a command and wait for the next CLI prompt.
@@ -2030,25 +2056,34 @@ def start_serial_session(
         try:
             session.open()
             on_log(f"[SERIAL] Opened {port}")
+            mode = (login_mode or get_login_mode() or "auto").strip().lower()
             on_log(
                 f"[SERIAL] Customer {get_active_customer_name()!r} "
-                f"({login_mode or get_login_mode()} login)"
+                f"({mode} login)"
             )
             if hostname_hint:
                 on_log(f"[SERIAL] Hostname: {hostname_hint}")
+
+            if mode == "skip":
+                session.attach_console()
+                on_success(session, port)
+                return
 
             success = session.login(
                 username,
                 password,
                 hostname_hint=hostname_hint,
-                login_mode=login_mode,
+                login_mode=mode,
             )
             if success:
                 on_success(session, port)
             else:
-                session.close()
-                on_log(f"[SERIAL] Login failed on {port}")
-                on_failure("login_failed")
+                on_log(
+                    f"[SERIAL] Login failed on {port} — "
+                    "opening the terminal anyway so you can type."
+                )
+                session.attach_console()
+                on_success(session, port)
         except Exception as e:
             try:
                 session.close()
@@ -2102,7 +2137,10 @@ class SerialWindow:
         self.window.after(600, self._init_session)
 
     def _init_session(self):
-        # Send terminal length 0 so we get full output without --More--
+        if not getattr(self.session, "auto_login", True):
+            return
+        if not self.session.connected:
+            return
         self.session.send_line("terminal length 0")
         self.window.after(400, lambda: self.session.send_line(""))
 
@@ -2178,11 +2216,20 @@ class SerialWindow:
         )
         self.output.pack(fill=tk.BOTH, expand=True, pady=(2, 6))
 
-        # Bottom bar
+        cmd_frame = ttk.Frame(content)
+        cmd_frame.pack(fill=tk.X, pady=(0, 6))
+        ttk.Label(cmd_frame, text="Send:").pack(side=tk.LEFT)
+        self.cmd_entry = ttk.Entry(cmd_frame)
+        self.cmd_entry.pack(side=tk.LEFT, padx=6, fill=tk.X, expand=True)
+        self.cmd_entry.bind("<Return>", lambda e: self.send_command())
+        ttk.Button(cmd_frame, text="Send", command=self.send_command, width=10).pack(
+            side=tk.LEFT
+        )
+
         bottom = ttk.Frame(content)
         bottom.pack(fill=tk.X)
 
-        self.status_var = tk.StringVar(value="Ready — Use sections above (structure from menu map).")
+        self.status_var = tk.StringVar(value="Ready — type in Send or open Cli terminal.")
         ttk.Label(bottom, textvariable=self.status_var, foreground="#333").pack(side=tk.LEFT)
 
         ttk.Button(bottom, text="Disconnect", command=self.disconnect).pack(side=tk.RIGHT)
@@ -2295,6 +2342,12 @@ class SerialWindow:
         except Exception as e:
             self.append_output(f"[MAC tree error] {e}")
 
+    def send_command(self):
+        """Send whatever is in the bar, including a bare Enter (Cisco Press RETURN)."""
+        cmd = self.cmd_entry.get()
+        self.session.send_line(cmd)
+        self.cmd_entry.delete(0, tk.END)
+
     def open_manual_terminal_window(self):
         """Opens the dedicated sub-sub window for manual commands (fulfills 'Open terminal / Cli terminal')."""
         ManualTerminalWindow(self.window, self.session, self.port_name)
@@ -2389,6 +2442,7 @@ class ManualTerminalWindow:
         ttk.Button(cmd_frame, text="Send", command=self.send_command).pack(side=tk.LEFT, padx=4)
         ttk.Button(cmd_frame, text="Clear Output", command=self.clear_output).pack(side=tk.LEFT, padx=4)
         ttk.Button(cmd_frame, text="Close Window", command=self.close_window).pack(side=tk.RIGHT)
+        self.cmd_entry.focus_set()
 
         self.status_var = tk.StringVar(value="Type commands above. Output appears here and in the Auto Commands window.")
         ttk.Label(content, textvariable=self.status_var, foreground="#555").pack(anchor=tk.W, pady=(4, 0))
@@ -2415,12 +2469,11 @@ class ManualTerminalWindow:
         self.poll_after_id = self.window.after(120, self.poll_serial_output)
 
     def send_command(self):
-        cmd = self.cmd_entry.get().strip()
-        if cmd:
-            self.status_var.set(f"Sent: {cmd}")
-            self.session.send_line(cmd)
-            self.cmd_entry.delete(0, tk.END)
-            self.window.after(300, lambda: self.status_var.set("Type commands above..."))
+        cmd = self.cmd_entry.get()
+        self.status_var.set("Sent" if cmd.strip() else "Sent Enter")
+        self.session.send_line(cmd)
+        self.cmd_entry.delete(0, tk.END)
+        self.window.after(300, lambda: self.status_var.set("Type commands above..."))
 
     def clear_output(self):
         self.output.config(state=tk.NORMAL)
@@ -2501,7 +2554,7 @@ class CDP_LLDP_GUI:
 
         settings_menu = tk.Menu(menubar, tearoff=0)
         settings_menu.add_command(
-            label="Customer Profiles...",
+            label="Usernames & Passwords...",
             command=self.open_serial_credentials_dialog,
         )
         menubar.add_cascade(label="Settings", menu=settings_menu)
@@ -2763,11 +2816,11 @@ class CDP_LLDP_GUI:
         self.customer_var.set(f"Customer: {name}  |  login: {mode}")
 
     def open_serial_credentials_dialog(self):
-        """Settings > Customer Profiles — one customer per site, secrets stay segregated."""
+        """Settings > Usernames & Passwords — one customer per site, secrets stay segregated."""
         dlg = tk.Toplevel(self.root)
-        dlg.title("Customer Profiles")
-        dlg.geometry("760x520")
-        dlg.minsize(680, 460)
+        dlg.title("Usernames & Passwords")
+        dlg.geometry("760x560")
+        dlg.minsize(680, 500)
         dlg.transient(self.root)
         dlg.grab_set()
 
@@ -2777,9 +2830,10 @@ class CDP_LLDP_GUI:
         ttk.Label(
             frame,
             text=(
-                "Each customer is a separate local-account bag. Serial login never "
-                "tries another customer's secrets. Auto-try uses this customer's "
-                "default plus host exceptions; manual uses one selected hostname."
+                "Edit and save the username and password for each customer. "
+                "Close or Save writes them to this Windows user's secret store. "
+                "Auto-try uses these secrets; Skip login opens the serial terminal "
+                "without typing them."
             ),
             wraplength=720,
         ).pack(anchor=tk.W, pady=(0, 8))
@@ -2793,6 +2847,9 @@ class CDP_LLDP_GUI:
         ).pack(side=tk.LEFT, padx=8)
         ttk.Radiobutton(
             mode_frame, text="Manual host selection", variable=mode_var, value="manual"
+        ).pack(side=tk.LEFT, padx=8)
+        ttk.Radiobutton(
+            mode_frame, text="Skip login — open terminal", variable=mode_var, value="skip"
         ).pack(side=tk.LEFT, padx=8)
 
         body = ttk.Frame(frame)
@@ -2887,50 +2944,62 @@ class CDP_LLDP_GUI:
         def add_customer():
             name = new_name_var.get().strip()
             if not name:
-                messagebox.showwarning("Customer Profiles", "Enter a customer name.", parent=dlg)
+                messagebox.showwarning("Usernames & Passwords", "Enter a customer name.", parent=dlg)
                 return
             if _find_customer_index(name) is not None:
                 messagebox.showwarning(
-                    "Customer Profiles",
+                    "Usernames & Passwords",
                     "That customer already exists. Select it in the list.",
                     parent=dlg,
                 )
                 return
             if not upsert_customer(name, "", ""):
-                messagebox.showerror("Customer Profiles", "Could not save settings.json.", parent=dlg)
+                messagebox.showerror(
+                    "Usernames & Passwords",
+                    "Could not save credentials (Windows secret store).",
+                    parent=dlg,
+                )
                 return
             new_name_var.set("")
             refresh_list(name)
             load_selected()
 
-        def save_customer():
+        def save_customer(quiet=False):
             name = name_var.get().strip()
             username = user_var.get().strip()
-            password = pass_var.get().strip()
-            if not name or not username or not password:
-                messagebox.showwarning(
-                    "Customer Profiles",
-                    "Customer name, username, and password are required.",
-                    parent=dlg,
-                )
-                return
+            password = pass_var.get()
+            if not name:
+                if not quiet:
+                    messagebox.showwarning(
+                        "Usernames & Passwords",
+                        "Customer name is required.",
+                        parent=dlg,
+                    )
+                return False
             sel = cust_list.curselection()
             old_name = cust_list.get(sel[0]) if sel else get_active_customer_name()
             if normalize_customer_name(old_name) != normalize_customer_name(name):
                 if not rename_customer(old_name, name):
-                    messagebox.showwarning(
-                        "Customer Profiles",
-                        "Could not rename — that customer name may already exist.",
+                    if not quiet:
+                        messagebox.showwarning(
+                            "Usernames & Passwords",
+                            "Could not rename — that customer name may already exist.",
+                            parent=dlg,
+                        )
+                    return False
+            if not upsert_customer(name, username, password):
+                if not quiet:
+                    messagebox.showerror(
+                        "Usernames & Passwords",
+                        "Could not save credentials (Windows secret store).",
                         parent=dlg,
                     )
-                    return
-            if not upsert_customer(name, username, password):
-                messagebox.showerror("Customer Profiles", "Could not save settings.json.", parent=dlg)
-                return
+                return False
             set_login_mode(mode_var.get())
             refresh_list(name)
             load_selected()
             self._refresh_customer_label()
+            return True
 
         def remove_customer():
             sel = cust_list.curselection()
@@ -2939,7 +3008,7 @@ class CDP_LLDP_GUI:
             name = cust_list.get(sel[0])
             if not delete_customer(name):
                 messagebox.showwarning(
-                    "Customer Profiles",
+                    "Usernames & Passwords",
                     "Keep at least one customer profile.",
                     parent=dlg,
                 )
@@ -2953,14 +3022,18 @@ class CDP_LLDP_GUI:
             password = ppass_var.get().strip() or pass_var.get().strip()
             if not hostname or not username or not password:
                 messagebox.showwarning(
-                    "Customer Profiles",
+                    "Usernames & Passwords",
                     "Hostname, username, and password are required.",
                     parent=dlg,
                 )
                 return
             save_customer()
             if not upsert_hostname_profile(hostname, username, password):
-                messagebox.showerror("Customer Profiles", "Could not save settings.json.", parent=dlg)
+                messagebox.showerror(
+                    "Usernames & Passwords",
+                    "Could not save credentials (Windows secret store).",
+                    parent=dlg,
+                )
                 return
             host_var.set("")
             puser_var.set("")
@@ -2977,7 +3050,11 @@ class CDP_LLDP_GUI:
                 if normalize_hostname(p["hostname"]) != normalize_hostname(hostname)
             ]
             if not save_profiles(remaining):
-                messagebox.showerror("Customer Profiles", "Could not save settings.json.", parent=dlg)
+                messagebox.showerror(
+                    "Usernames & Passwords",
+                    "Could not save credentials (Windows secret store).",
+                    parent=dlg,
+                )
                 return
             load_selected()
 
@@ -2995,13 +3072,14 @@ class CDP_LLDP_GUI:
         bottom.pack(fill=tk.X, pady=(10, 0))
 
         def close_dialog():
+            save_customer(quiet=True)
             set_login_mode(mode_var.get())
             self._refresh_customer_label()
             dlg.destroy()
 
-        ttk.Button(bottom, text="Save customer", command=save_customer, width=16).pack(
-            side=tk.RIGHT, padx=4
-        )
+        ttk.Button(
+            bottom, text="Save usernames & passwords", command=save_customer, width=26
+        ).pack(side=tk.RIGHT, padx=4)
         ttk.Button(bottom, text="Close", command=close_dialog, width=10).pack(side=tk.RIGHT)
 
         refresh_list()
@@ -3028,17 +3106,195 @@ class CDP_LLDP_GUI:
         # Open a selection sub-dialog
         self._show_port_selection_dialog(ports)
 
+    def _open_add_customer_dialog(self, parent, on_saved=None):
+        """Serial helper: name + username + password → DPAPI store. Does not change login mode."""
+        win = tk.Toplevel(parent)
+        win.title("Add customer")
+        win.geometry("440x240")
+        win.minsize(400, 220)
+        win.transient(parent)
+        win.grab_set()
+
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            frame,
+            text=(
+                "Creates a customer profile and stores the username and password "
+                "in this Windows user's secret store (DPAPI). Names stay in "
+                "settings.json; passwords do not."
+            ),
+            wraplength=400,
+        ).pack(anchor=tk.W, pady=(0, 10))
+
+        name_var = tk.StringVar()
+        user_var = tk.StringVar()
+        pass_var = tk.StringVar()
+
+        grid = ttk.Frame(frame)
+        grid.pack(fill=tk.X)
+        ttk.Label(grid, text="Customer name:").grid(row=0, column=0, sticky=tk.W, pady=4)
+        name_entry = ttk.Entry(grid, textvariable=name_var, width=32)
+        name_entry.grid(row=0, column=1, sticky=tk.W, padx=6)
+        ttk.Label(grid, text="Username:").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(grid, textvariable=user_var, width=32).grid(
+            row=1, column=1, sticky=tk.W, padx=6
+        )
+        ttk.Label(grid, text="Password:").grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(grid, textvariable=pass_var, width=32, show="*").grid(
+            row=2, column=1, sticky=tk.W, padx=6
+        )
+
+        def save():
+            name = name_var.get().strip()
+            username = user_var.get().strip()
+            password = pass_var.get()
+            if not name:
+                messagebox.showwarning(
+                    "Add customer", "Customer name is required.", parent=win
+                )
+                return
+            if not username or not password:
+                messagebox.showwarning(
+                    "Add customer",
+                    "Username and password are required.",
+                    parent=win,
+                )
+                return
+            if _find_customer_index(name) is not None:
+                messagebox.showwarning(
+                    "Add customer",
+                    "That customer already exists. Select it in the dropdown.",
+                    parent=win,
+                )
+                return
+            if not upsert_customer(name, username, password):
+                messagebox.showerror(
+                    "Add customer",
+                    "Could not save credentials (Windows secret store).",
+                    parent=win,
+                )
+                return
+            self._refresh_customer_label()
+            win.destroy()
+            if on_saved:
+                on_saved(name)
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill=tk.X, pady=(16, 0))
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Save", command=save, width=10).pack(side=tk.RIGHT, padx=6)
+        name_entry.focus_set()
+        win.bind("<Return>", lambda e: save())
+
+    def _open_add_device_dialog(
+        self, parent, customer_name=None, hostname=None, on_saved=None
+    ):
+        """Serial helper: per-device user/pass on the active customer. Default is unchanged."""
+        customer_name = (
+            str(customer_name or "").strip() or get_active_customer_name()
+        )
+        if customer_name:
+            set_active_customer(customer_name)
+        preset = str(hostname or "").strip()
+        if preset.startswith("(unknown"):
+            preset = ""
+
+        win = tk.Toplevel(parent)
+        win.title("Add device login")
+        win.geometry("460x270")
+        win.minsize(420, 250)
+        win.transient(parent)
+        win.grab_set()
+
+        frame = ttk.Frame(win, padding=12)
+        frame.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(
+            frame,
+            text=(
+                f"Customer: {customer_name}\n"
+                "Saves a device-specific username and password for this customer. "
+                "The customer default is not changed. Stored in this Windows user's "
+                "secret store (DPAPI)."
+            ),
+            wraplength=420,
+        ).pack(anchor=tk.W, pady=(0, 10))
+
+        host_var = tk.StringVar(value=preset)
+        user_var = tk.StringVar()
+        pass_var = tk.StringVar()
+
+        existing = credentials_for_hostname(preset) if preset else None
+        if existing:
+            user_var.set(existing[0] or "")
+            pass_var.set(existing[1] or "")
+
+        grid = ttk.Frame(frame)
+        grid.pack(fill=tk.X)
+        ttk.Label(grid, text="Device name:").grid(row=0, column=0, sticky=tk.W, pady=4)
+        host_entry = ttk.Entry(grid, textvariable=host_var, width=32)
+        host_entry.grid(row=0, column=1, sticky=tk.W, padx=6)
+        ttk.Label(grid, text="Username:").grid(row=1, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(grid, textvariable=user_var, width=32).grid(
+            row=1, column=1, sticky=tk.W, padx=6
+        )
+        ttk.Label(grid, text="Password:").grid(row=2, column=0, sticky=tk.W, pady=4)
+        ttk.Entry(grid, textvariable=pass_var, width=32, show="*").grid(
+            row=2, column=1, sticky=tk.W, padx=6
+        )
+
+        def save():
+            host = host_var.get().strip()
+            username = user_var.get().strip()
+            password = pass_var.get()
+            if not host:
+                messagebox.showwarning(
+                    "Add device login", "Device name is required.", parent=win
+                )
+                return
+            if not username or not password:
+                messagebox.showwarning(
+                    "Add device login",
+                    "Username and password are required.",
+                    parent=win,
+                )
+                return
+            if customer_name:
+                set_active_customer(customer_name)
+            if not upsert_hostname_profile(host, username, password):
+                messagebox.showerror(
+                    "Add device login",
+                    "Could not save credentials (Windows secret store).",
+                    parent=win,
+                )
+                return
+            win.destroy()
+            if on_saved:
+                on_saved(host)
+
+        btns = ttk.Frame(frame)
+        btns.pack(fill=tk.X, pady=(16, 0))
+        ttk.Button(btns, text="Cancel", command=win.destroy).pack(side=tk.RIGHT)
+        ttk.Button(btns, text="Save", command=save, width=10).pack(side=tk.RIGHT, padx=6)
+        host_entry.focus_set()
+        win.bind("<Return>", lambda e: save())
+
     def _show_port_selection_dialog(self, ports):
-        """Choose COM port, customer, auto vs manual host login."""
+        """Choose COM port, edit/save credentials, auto-login or skip to terminal."""
         dlg = tk.Toplevel(self.root)
-        dlg.title("Select Serial Port")
-        dlg.geometry("540x430")
+        dlg.title("Serial connection")
+        dlg.geometry("560x560")
+        dlg.minsize(520, 500)
         dlg.transient(self.root)
         dlg.grab_set()
 
-        ttk.Label(dlg, text="Available COM ports (select one):", font=("Segoe UI", 10, "bold")).pack(pady=8)
+        ttk.Label(
+            dlg, text="COM port:", font=("Segoe UI", 10, "bold")
+        ).pack(anchor=tk.W, padx=10, pady=(10, 4))
 
-        listbox = tk.Listbox(dlg, height=7)
+        listbox = tk.Listbox(dlg, height=6)
         listbox.pack(fill=tk.BOTH, expand=True, padx=10)
 
         port_map = {}
@@ -3046,9 +3302,11 @@ class CDP_LLDP_GUI:
             display = f"{p.device} — {p.description}"
             listbox.insert(tk.END, display)
             port_map[display] = p.device
+        if port_map:
+            listbox.selection_set(0)
 
         cust_frame = ttk.Frame(dlg)
-        cust_frame.pack(fill=tk.X, padx=10, pady=(8, 0))
+        cust_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
         ttk.Label(cust_frame, text="Customer:").pack(side=tk.LEFT)
         customer_var = tk.StringVar(value=get_active_customer_name())
         customer_combo = ttk.Combobox(
@@ -3060,28 +3318,77 @@ class CDP_LLDP_GUI:
         )
         customer_combo.pack(side=tk.LEFT, padx=8)
 
-        mode_frame = ttk.Frame(dlg)
-        mode_frame.pack(fill=tk.X, padx=10, pady=(6, 0))
-        mode_var = tk.StringVar(value=get_login_mode())
-        ttk.Label(mode_frame, text="Login:").pack(side=tk.LEFT)
-        ttk.Radiobutton(
-            mode_frame, text="Auto-try this customer", variable=mode_var, value="auto"
-        ).pack(side=tk.LEFT, padx=8)
-        ttk.Radiobutton(
-            mode_frame, text="Manual host", variable=mode_var, value="manual"
-        ).pack(side=tk.LEFT, padx=8)
+        cred_frame = ttk.LabelFrame(dlg, text="Username & password", padding=8)
+        cred_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+        user_var = tk.StringVar()
+        pass_var = tk.StringVar()
+        ttk.Label(cred_frame, text="Username:").grid(row=0, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(cred_frame, textvariable=user_var, width=32).grid(
+            row=0, column=1, sticky=tk.W, padx=6
+        )
+        ttk.Label(cred_frame, text="Password:").grid(row=1, column=0, sticky=tk.W, pady=3)
+        ttk.Entry(cred_frame, textvariable=pass_var, width=32, show="*").grid(
+            row=1, column=1, sticky=tk.W, padx=6
+        )
 
-        hint_frame = ttk.Frame(dlg)
-        hint_frame.pack(fill=tk.X, padx=10, pady=(6, 0))
-        ttk.Label(hint_frame, text="Hostname:").pack(side=tk.LEFT)
-        hint_var = tk.StringVar()
-        hint_combo = ttk.Combobox(hint_frame, textvariable=hint_var, width=32)
-        hint_combo.pack(side=tk.LEFT, padx=8, fill=tk.X, expand=True)
-
-        def refresh_hosts():
+        def load_creds():
             chosen = customer_var.get().strip()
             if chosen:
                 set_active_customer(chosen)
+            user, pwd = get_credentials()
+            user_var.set(user or "")
+            pass_var.set(pwd or "")
+            self._refresh_customer_label()
+
+        def save_creds():
+            chosen = customer_var.get().strip() or get_active_customer_name()
+            if chosen:
+                set_active_customer(chosen)
+            if not upsert_customer(chosen, user_var.get(), pass_var.get()):
+                messagebox.showerror(
+                    "Serial",
+                    "Could not save credentials (Windows secret store).",
+                    parent=dlg,
+                )
+                return False
+            load_creds()
+            return True
+
+        ttk.Button(
+            cred_frame, text="Save to this customer", command=save_creds
+        ).grid(row=0, column=2, rowspan=2, padx=8)
+
+        mode_frame = ttk.LabelFrame(dlg, text="When connecting", padding=8)
+        mode_frame.pack(fill=tk.X, padx=10, pady=(10, 0))
+        mode_var = tk.StringVar(value=get_login_mode())
+        ttk.Radiobutton(
+            mode_frame,
+            text="Auto-try saved username/password",
+            variable=mode_var,
+            value="auto",
+        ).pack(anchor=tk.W)
+        ttk.Radiobutton(
+            mode_frame,
+            text="Manual host (use that host's saved secret)",
+            variable=mode_var,
+            value="manual",
+        ).pack(anchor=tk.W)
+        ttk.Radiobutton(
+            mode_frame,
+            text="Skip login — just open the terminal",
+            variable=mode_var,
+            value="skip",
+        ).pack(anchor=tk.W)
+
+        hint_frame = ttk.Frame(dlg)
+        hint_frame.pack(fill=tk.X, padx=10, pady=(8, 0))
+        ttk.Label(hint_frame, text="Hostname:").pack(side=tk.LEFT)
+        hint_var = tk.StringVar()
+        hint_combo = ttk.Combobox(hint_frame, textvariable=hint_var, width=28)
+        hint_combo.pack(side=tk.LEFT, padx=8)
+
+        def refresh_hosts():
+            load_creds()
             hosts = ["(unknown)"]
             seen = set()
             for name in get_profile_hostnames():
@@ -3097,31 +3404,78 @@ class CDP_LLDP_GUI:
             hint_combo["values"] = hosts
             if not hint_var.get() or hint_var.get() not in hosts:
                 hint_var.set(hosts[0])
-            self._refresh_customer_label()
+
+        def sync_mode_widgets(*_args):
+            skip = mode_var.get() == "skip"
+            state = tk.DISABLED if skip else tk.NORMAL
+            hint_combo.configure(state=state)
 
         customer_combo.bind("<<ComboboxSelected>>", lambda e: refresh_hosts())
+        mode_var.trace_add("write", sync_mode_widgets)
         refresh_hosts()
+        sync_mode_widgets()
+
+        def add_customer_clicked():
+            def after_add(name):
+                customer_combo["values"] = get_customer_names()
+                customer_var.set(name)
+                refresh_hosts()
+
+            self._open_add_customer_dialog(dlg, on_saved=after_add)
+
+        ttk.Button(
+            cust_frame, text="Add customer...", command=add_customer_clicked
+        ).pack(side=tk.LEFT)
+
+        def add_device_clicked():
+            chosen_customer = customer_var.get().strip()
+            if chosen_customer:
+                set_active_customer(chosen_customer)
+
+            def after_add(hostname):
+                refresh_hosts()
+                hint_var.set(hostname)
+
+            self._open_add_device_dialog(
+                dlg,
+                customer_name=chosen_customer or get_active_customer_name(),
+                hostname=hint_var.get(),
+                on_saved=after_add,
+            )
+
+        ttk.Button(
+            hint_frame, text="Add device...", command=add_device_clicked
+        ).pack(side=tk.LEFT)
 
         def do_connect():
             sel = listbox.curselection()
             if not sel:
+                messagebox.showwarning("Serial", "Select a COM port.", parent=dlg)
                 return
             chosen_display = listbox.get(sel[0])
             chosen_port = port_map[chosen_display]
             chosen_customer = customer_var.get().strip()
             if chosen_customer:
                 set_active_customer(chosen_customer)
+            if not upsert_customer(chosen_customer or get_active_customer_name(),
+                                   user_var.get(), pass_var.get()):
+                messagebox.showerror(
+                    "Serial",
+                    "Could not save credentials (Windows secret store).",
+                    parent=dlg,
+                )
+                return
             mode = mode_var.get().strip() or "auto"
             set_login_mode(mode)
             hint = hint_var.get().strip()
-            if not hint or hint.startswith("(unknown"):
+            if mode == "skip" or not hint or hint.startswith("(unknown"):
                 hint = None
             dlg.destroy()
             self._refresh_customer_label()
             self._start_serial_login(chosen_port, hostname_hint=hint, login_mode=mode)
 
         btn_frame = ttk.Frame(dlg)
-        btn_frame.pack(pady=8)
+        btn_frame.pack(pady=12)
         ttk.Button(btn_frame, text="Connect", command=do_connect).pack(side=tk.LEFT, padx=6)
         ttk.Button(btn_frame, text="Cancel", command=dlg.destroy).pack(side=tk.LEFT, padx=6)
 
@@ -3171,6 +3525,8 @@ class CDP_LLDP_GUI:
         self.current_serial = session
         self.serial_window = SerialWindow(self.root, session, port_name)
         self.status_var.set(f"Serial connected: {port_name}")
+        if not getattr(session, "auto_login", True):
+            self.serial_window.open_manual_terminal_window()
 
     # ==================== Queue processor (extended) ====================
 
